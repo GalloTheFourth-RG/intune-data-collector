@@ -134,95 +134,204 @@ if ($DryRun) {
 # Helper Functions
 # =========================================================
 
-function Invoke-IntuneExportReport {
+function Submit-ExportJob {
     <#
     .SYNOPSIS
-        Exports an Intune report via the Graph Export API.
-    .DESCRIPTION
-        Posts an export job, polls until complete, downloads the result ZIP,
-        extracts the CSV/JSON, and returns the parsed data.
+        Submits an Intune export job and returns the job ID (does not wait).
     #>
     param(
         [Parameter(Mandatory)]
         [string]$ReportName,
-
         [string]$Filter = $null,
-
         [string[]]$Select = $null,
-
-        [int]$TimeoutSeconds = 300,
-
-        [int]$PollIntervalSeconds = 5
+        [int]$MaxRetries = 2
     )
-
-    Write-Host "  Exporting $ReportName..." -ForegroundColor Gray -NoNewline
 
     $body = @{ reportName = $ReportName; format = "json" }
     if ($Filter) { $body.filter = $Filter }
     if ($Select) { $body.select = $Select }
 
-    try {
-        # Create export job
-        $job = Invoke-MgGraphRequest -Method POST `
-            -Uri "https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs" `
-            -Body ($body | ConvertTo-Json -Depth 5) `
-            -ContentType "application/json"
-
-        $jobId = $job.id
-        $elapsed = 0
-
-        # Poll until complete
-        while ($elapsed -lt $TimeoutSeconds) {
-            Start-Sleep -Seconds $PollIntervalSeconds
-            $elapsed += $PollIntervalSeconds
-
-            $status = Invoke-MgGraphRequest -Method GET `
-                -Uri "https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs('$jobId')"
-
-            if ($status.status -eq "completed") {
-                $downloadUrl = $status.url
-
-                # Download the ZIP
-                $tempZip = Join-Path ([System.IO.Path]::GetTempPath()) "$ReportName`_$(Get-Random).zip"
-                Invoke-WebRequest -Uri $downloadUrl -OutFile $tempZip
-
-                # Extract
-                $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) "$ReportName`_$(Get-Random)"
-                Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
-
-                # Parse the result file
-                $resultFile = Get-ChildItem -Path $tempExtract -Recurse -File | Select-Object -First 1
-                $data = $null
-                if ($resultFile) {
-                    if ($resultFile.Extension -eq ".json") {
-                        $data = Get-Content $resultFile.FullName -Raw | ConvertFrom-Json
-                    } elseif ($resultFile.Extension -eq ".csv") {
-                        $data = Import-Csv $resultFile.FullName
-                    }
-                }
-
-                # Cleanup temp files
-                Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
-                Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
-
-                $count = if ($null -eq $data) { 0 } elseif ($data -is [array]) { $data.Count } else { 1 }
-                Write-Host " ✓ ($count records)" -ForegroundColor Green
-                return $data
-            }
-
-            if ($status.status -eq "failed") {
-                Write-Host " ✗ Export failed" -ForegroundColor Red
+    for ($attempt = 0; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $job = Invoke-MgGraphRequest -Method POST `
+                -Uri "https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs" `
+                -Body ($body | ConvertTo-Json -Depth 5) `
+                -ContentType "application/json"
+            return $job.id
+        } catch {
+            $statusCode = $null
+            try { if ($null -ne $_.Exception -and $null -ne $_.Exception.PSObject.Properties['Response'] -and $null -ne $_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode } } catch { }
+            if ($statusCode -eq 429 -and $attempt -lt $MaxRetries) {
+                $retryAfter = 5 * ($attempt + 1)
+                Write-Host "    [throttled on $ReportName, retry in ${retryAfter}s]" -ForegroundColor Yellow
+                Start-Sleep -Seconds $retryAfter
+            } else {
+                Write-Host "    [FAIL] Submit $ReportName - $($_.Exception.Message)" -ForegroundColor Red
                 return $null
             }
         }
-
-        Write-Host " ✗ Timed out after ${TimeoutSeconds}s" -ForegroundColor Yellow
-        return $null
-
-    } catch {
-        Write-Host " ✗ $($_.Exception.Message)" -ForegroundColor Red
-        return $null
     }
+    return $null
+}
+
+function Get-ExportResult {
+    <#
+    .SYNOPSIS
+        Downloads and parses a completed export job result.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [string]$DownloadUrl,
+        [Parameter(Mandatory)]
+        [string]$ReportName
+    )
+
+    $tempZip = Join-Path ([System.IO.Path]::GetTempPath()) "$ReportName`_$(Get-Random).zip"
+    $tempExtract = Join-Path ([System.IO.Path]::GetTempPath()) "$ReportName`_$(Get-Random)"
+
+    try {
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $tempZip -UseBasicParsing
+        Expand-Archive -Path $tempZip -DestinationPath $tempExtract -Force
+
+        $resultFile = Get-ChildItem -Path $tempExtract -Recurse -File | Select-Object -First 1
+        $data = $null
+        if ($resultFile) {
+            if ($resultFile.Extension -eq ".json") {
+                $data = Get-Content $resultFile.FullName -Raw | ConvertFrom-Json
+            } elseif ($resultFile.Extension -eq ".csv") {
+                $data = Import-Csv $resultFile.FullName
+            }
+        }
+        return $data
+    } finally {
+        Remove-Item $tempZip -Force -ErrorAction SilentlyContinue
+        Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Invoke-ExportBatch {
+    <#
+    .SYNOPSIS
+        Submits multiple export jobs at once and polls them all concurrently.
+        Returns a hashtable of Key -> Data.
+    .DESCRIPTION
+        Instead of waiting for each report sequentially, this submits all jobs
+        up front and polls them in a round-robin loop. The server processes
+        them concurrently, so total time = max(individual) instead of sum.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [array]$Reports,
+
+        [int]$TimeoutSeconds = 180
+    )
+
+    $results = @{}
+    $pending = [System.Collections.Generic.List[object]]::new()
+
+    # Submit all jobs with staggered timing to avoid 429 cascading
+    $submitIndex = 0
+    foreach ($report in $Reports) {
+        # Stagger submissions: pause 1s every 5 jobs to stay under rate limits
+        if ($submitIndex -gt 0 -and ($submitIndex % 5) -eq 0) {
+            Write-Host "    (pacing: 2s cooldown)" -ForegroundColor DarkGray
+            Start-Sleep -Seconds 2
+        } elseif ($submitIndex -gt 0) {
+            Start-Sleep -Milliseconds 500
+        }
+        $rFilter = if ($report.ContainsKey('Filter')) { $report.Filter } else { $null }
+        $rSelect = if ($report.ContainsKey('Select')) { $report.Select } else { $null }
+        $jobId = Submit-ExportJob -ReportName $report.ReportName `
+            -Filter $rFilter -Select $rSelect
+        if ($null -ne $jobId) {
+            $pending.Add(@{
+                Key        = $report.Key
+                ReportName = $report.ReportName
+                JobId      = $jobId
+            })
+            Write-Host "    Submitted $($report.ReportName)" -ForegroundColor DarkGray
+        } else {
+            $results[$report.Key] = $null
+        }
+        $submitIndex++
+    }
+
+    if ($pending.Count -eq 0) { return $results }
+
+    $submitCount = $pending.Count
+    Write-Host "  Waiting for $submitCount reports..." -ForegroundColor Gray -NoNewline
+
+    # Poll all pending jobs in a loop
+    $elapsed = 0
+    $pollInterval = 3     # check every 3s
+    $completedCount = 0
+
+    while ($pending.Count -gt 0 -and $elapsed -lt $TimeoutSeconds) {
+        Start-Sleep -Seconds $pollInterval
+        $elapsed += $pollInterval
+
+        $justCompleted = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($job in $pending) {
+            try {
+                $status = Invoke-MgGraphRequest -Method GET `
+                    -Uri "https://graph.microsoft.com/beta/deviceManagement/reports/exportJobs('$($job.JobId)')"
+
+                if ($status.status -eq "completed") {
+                    $data = Get-ExportResult -DownloadUrl $status.url -ReportName $job.ReportName
+                    $results[$job.Key] = $data
+                    $count = if ($null -eq $data) { 0 } elseif ($data -is [array]) { $data.Count } else { 1 }
+                    $completedCount++
+                    Write-Host "" # newline after dots
+                    Write-Host "    [OK] $($job.ReportName) ($count records)" -ForegroundColor Green
+                    if ($pending.Count -gt 1) {
+                        $remaining = $pending.Count - $justCompleted.Count - 1
+                        if ($remaining -gt 0) {
+                            Write-Host "  Waiting for $remaining more..." -ForegroundColor Gray -NoNewline
+                        }
+                    }
+                    $justCompleted.Add($job)
+                }
+                elseif ($status.status -eq "failed") {
+                    $results[$job.Key] = $null
+                    $completedCount++
+                    Write-Host "" # newline after dots
+                    Write-Host "    [FAIL] $($job.ReportName) - export failed" -ForegroundColor Red
+                    $justCompleted.Add($job)
+                }
+            } catch {
+                # Throttled on status check — skip this cycle, try next round
+                $sc = $null
+                try { if ($null -ne $_.Exception -and $null -ne $_.Exception.PSObject.Properties['Response'] -and $null -ne $_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode } } catch { }
+                if ($sc -eq 429) {
+                    Write-Host "t" -ForegroundColor Yellow -NoNewline  # throttle indicator
+                }
+            }
+        }
+
+        foreach ($done in $justCompleted) {
+            $pending.Remove($done) | Out-Null
+        }
+
+        # Progress dot
+        if ($pending.Count -gt 0) {
+            Write-Host "." -ForegroundColor DarkGray -NoNewline
+        }
+    }
+
+    # Handle timeouts
+    foreach ($job in $pending) {
+        Write-Host ""
+        Write-Host "    [WARN] $($job.ReportName) - timed out after ${TimeoutSeconds}s" -ForegroundColor Yellow
+        $results[$job.Key] = $null
+    }
+
+    if ($pending.Count -eq 0 -and $completedCount -gt 0) {
+        Write-Host ""
+    }
+    Write-Host "  Batch complete: $completedCount/$submitCount in ${elapsed}s" -ForegroundColor Cyan
+
+    return $results
 }
 
 function Invoke-GraphPagedRequest {
@@ -236,21 +345,56 @@ function Invoke-GraphPagedRequest {
     )
 
     $allResults = [System.Collections.Generic.List[object]]::new()
+    $maxRetries = 3
+
+    # Helper to safely extract a property from Graph response (may be Hashtable or PSCustomObject)
+    function Get-ResponseValue {
+        param($Response, [string]$Name)
+        if ($null -eq $Response) { return $null }
+        if ($Response -is [System.Collections.IDictionary]) {
+            if ($Response.ContainsKey($Name)) { return $Response[$Name] }
+            return $null
+        }
+        if ($Response.PSObject.Properties.Match($Name).Count -gt 0) {
+            return $Response.$Name
+        }
+        return $null
+    }
 
     try {
         $response = Invoke-MgGraphRequest -Method GET -Uri $Uri
-        if ($response.value) {
-            $allResults.AddRange([object[]]$response.value)
+        $pageValue = Get-ResponseValue $response 'value'
+        if ($null -ne $pageValue) {
+            $allResults.AddRange([object[]]$pageValue)
         }
 
-        while ($response.'@odata.nextLink') {
-            $response = Invoke-MgGraphRequest -Method GET -Uri $response.'@odata.nextLink'
-            if ($response.value) {
-                $allResults.AddRange([object[]]$response.value)
+        $nextLink = Get-ResponseValue $response '@odata.nextLink'
+        while ($null -ne $nextLink) {
+            $pageRetry = 0
+            $pageSuccess = $false
+            while (-not $pageSuccess -and $pageRetry -lt $maxRetries) {
+                try {
+                    $response = Invoke-MgGraphRequest -Method GET -Uri $nextLink
+                    $pageValue = Get-ResponseValue $response 'value'
+                    if ($null -ne $pageValue) {
+                        $allResults.AddRange([object[]]$pageValue)
+                    }
+                    $pageSuccess = $true
+                } catch {
+                    $pageRetry++
+                    $sc = $null
+                    try { if ($null -ne $_.Exception -and $null -ne $_.Exception.PSObject.Properties['Response'] -and $null -ne $_.Exception.Response) { $sc = [int]$_.Exception.Response.StatusCode } } catch { }
+                    if ($sc -eq 429 -and $pageRetry -lt $maxRetries) {
+                        Start-Sleep -Seconds (3 * $pageRetry)
+                    } else {
+                        throw
+                    }
+                }
             }
+            $nextLink = Get-ResponseValue $response '@odata.nextLink'
         }
     } catch {
-        Write-Host "  ⚠ Graph request failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  [WARN] Graph request failed: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 
     return $allResults.ToArray()
@@ -264,112 +408,123 @@ New-Item -ItemType Directory -Path $collectionDir -Force | Out-Null
 
 $collected = @{}
 
+# ─────────────────────────────────────────────────────────
+# Batch 1: Device Inventory + Compliance + Config (10 reports)
+# ─────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "Step 1: Device Inventory" -ForegroundColor Cyan
-Write-Host "─────────────────────────" -ForegroundColor Gray
+Write-Host "Batch 1: Device Inventory, Compliance, Configuration" -ForegroundColor Cyan
+Write-Host "─────────────────────────────────────────────────────" -ForegroundColor Gray
 
-$collected["devices"] = Invoke-IntuneExportReport -ReportName "DevicesWithInventory"
-$collected["device-health"] = Invoke-IntuneExportReport -ReportName "WindowsDeviceHealthAttestationReport"
-$collected["tpm-attestation"] = Invoke-IntuneExportReport -ReportName "TpmAttestationStatus"
+$batch1 = @(
+    @{ Key = "devices";               ReportName = "DevicesWithInventory" }
+    @{ Key = "device-health";         ReportName = "WindowsDeviceHealthAttestationReport" }
+    @{ Key = "tpm-attestation";       ReportName = "TpmAttestationStatus" }
+    @{ Key = "compliance-status";     ReportName = "DeviceCompliance" }
+    @{ Key = "compliance-policies";   ReportName = "NonCompliantCompliancePoliciesAggregate" }
+    @{ Key = "devices-without-policy"; ReportName = "DevicesWithoutCompliancePolicy" }
+    @{ Key = "noncompliant-settings"; ReportName = "NoncompliantDevicesAndSettings" }
+    @{ Key = "config-aggregate";      ReportName = "ConfigurationPolicyAggregate" }
+    @{ Key = "config-non-compliant";  ReportName = "NonCompliantConfigurationPoliciesAggregateWithPF" }
+    @{ Key = "compliance-trend";      ReportName = "DeviceComplianceTrend" }
+)
+$batch1Results = Invoke-ExportBatch -Reports $batch1
+foreach ($key in $batch1Results.Keys) { $collected[$key] = $batch1Results[$key] }
 
+# Inter-batch cooldown — Intune rate limits cascade across export endpoints
+Write-Host "  (inter-batch cooldown: 5s)" -ForegroundColor DarkGray
+Start-Sleep -Seconds 5
+
+# ─────────────────────────────────────────────────────────
+# Batch 2: Apps + Security + Autopilot + Updates (up to 14 reports)
+# ─────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "Step 2: Compliance" -ForegroundColor Cyan
-Write-Host "───────────────────" -ForegroundColor Gray
+Write-Host "Batch 2: Apps, Security, Autopilot, Updates" -ForegroundColor Cyan
+Write-Host "────────────────────────────────────────────" -ForegroundColor Gray
 
-$collected["compliance-status"] = Invoke-IntuneExportReport -ReportName "DeviceCompliance"
-$collected["compliance-trends"] = Invoke-IntuneExportReport -ReportName "DeviceComplianceTrend"
-$collected["compliance-policies"] = Invoke-IntuneExportReport -ReportName "NonCompliantCompliancePoliciesAggregate"
-$collected["devices-without-policy"] = Invoke-IntuneExportReport -ReportName "DevicesWithoutCompliancePolicy"
-$collected["noncompliant-settings"] = Invoke-IntuneExportReport -ReportName "NoncompliantDevicesAndSettings"
-
-Write-Host ""
-Write-Host "Step 3: Configuration Profiles" -ForegroundColor Cyan
-Write-Host "───────────────────────────────" -ForegroundColor Gray
-
-$collected["config-aggregate"] = Invoke-IntuneExportReport -ReportName "ConfigurationPolicyAggregate"
-$collected["config-non-compliant"] = Invoke-IntuneExportReport -ReportName "NonCompliantConfigurationPoliciesAggregateWithPF"
-
-Write-Host ""
-Write-Host "Step 4: Applications" -ForegroundColor Cyan
-Write-Host "─────────────────────" -ForegroundColor Gray
+$batch2 = [System.Collections.Generic.List[object]]::new()
 
 if (-not $SkipApps) {
-    $collected["apps-list"] = Invoke-IntuneExportReport -ReportName "AllAppsList"
-    $collected["apps-install-status"] = Invoke-IntuneExportReport -ReportName "AppInstallStatusAggregate"
-    $collected["apps-discovered"] = Invoke-IntuneExportReport -ReportName "AppInvAggregate"
+    $batch2.Add(@{ Key = "apps-list";           ReportName = "AllAppsList" })
+    $batch2.Add(@{ Key = "apps-install-status"; ReportName = "AppInstallStatusAggregate" })
+    $batch2.Add(@{ Key = "apps-discovered";     ReportName = "AppInvAggregate" })
 } else {
-    Write-Host "  ○ Skipped (SkipApps)" -ForegroundColor Gray
+    Write-Host "  [SKIP] Apps (SkipApps)" -ForegroundColor Gray
 }
-
-Write-Host ""
-Write-Host "Step 5: Security" -ForegroundColor Cyan
-Write-Host "──────────────────" -ForegroundColor Gray
 
 if (-not $SkipSecurity) {
-    $collected["defender-agents"] = Invoke-IntuneExportReport -ReportName "DefenderAgents"
-    $collected["unhealthy-defender"] = Invoke-IntuneExportReport -ReportName "UnhealthyDefenderAgents"
-    $collected["malware"] = Invoke-IntuneExportReport -ReportName "ActiveMalware"
-    $collected["firewall-status"] = Invoke-IntuneExportReport -ReportName "FirewallStatus"
-    $collected["epm-elevations"] = Invoke-IntuneExportReport -ReportName "EpmElevationReportElevationEvent"
+    $batch2.Add(@{ Key = "defender-agents";    ReportName = "DefenderAgents" })
+    $batch2.Add(@{ Key = "unhealthy-defender"; ReportName = "UnhealthyDefenderAgents" })
+    $batch2.Add(@{ Key = "malware";            ReportName = "ActiveMalware" })
+    $batch2.Add(@{ Key = "firewall-status";    ReportName = "FirewallStatus" })
+    $batch2.Add(@{ Key = "epm-elevations";     ReportName = "EpmElevationReportElevationEvent" })
 } else {
-    Write-Host "  ○ Skipped (SkipSecurity)" -ForegroundColor Gray
+    Write-Host "  [SKIP] Security (SkipSecurity)" -ForegroundColor Gray
 }
 
+$batch2.Add(@{ Key = "autopilot-status";       ReportName = "AutopilotV2DeploymentStatus" })
+$batch2.Add(@{ Key = "enrollment-activity";    ReportName = "EnrollmentActivity" })
+$batch2.Add(@{ Key = "update-driver-summary";  ReportName = "DriverUpdatePolicyStatusSummary" })
+$batch2.Add(@{ Key = "update-feature-summary"; ReportName = "FeatureUpdatePolicyStatusSummary" })
+$batch2.Add(@{ Key = "update-quality-summary"; ReportName = "QualityUpdatePolicyStatusSummary" })
+
+if ($batch2.Count -gt 0) {
+    $batch2Results = Invoke-ExportBatch -Reports $batch2.ToArray()
+    foreach ($key in $batch2Results.Keys) { $collected[$key] = $batch2Results[$key] }
+}
+
+# Inter-batch cooldown
+Write-Host "  (inter-batch cooldown: 5s)" -ForegroundColor DarkGray
+Start-Sleep -Seconds 5
+
+# ─────────────────────────────────────────────────────────
+# Batch 3: Endpoint Analytics (10 reports) + Co-management
+# ─────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "Step 6: Autopilot & Enrollment" -ForegroundColor Cyan
-Write-Host "───────────────────────────────" -ForegroundColor Gray
+Write-Host "Batch 3: Endpoint Analytics, Co-management, GP Migration" -ForegroundColor Cyan
+Write-Host "─────────────────────────────────────────────────────────" -ForegroundColor Gray
 
-$collected["autopilot-status"] = Invoke-IntuneExportReport -ReportName "AutopilotV2DeploymentStatus"
-$collected["enrollment-failures"] = Invoke-IntuneExportReport -ReportName "DeviceEnrollmentFailures"
-$collected["enrollment-activity"] = Invoke-IntuneExportReport -ReportName "EnrollmentActivity"
-
-Write-Host ""
-Write-Host "Step 7: Windows Updates" -ForegroundColor Cyan
-Write-Host "────────────────────────" -ForegroundColor Gray
-
-$collected["update-driver-summary"] = Invoke-IntuneExportReport -ReportName "DriverUpdatePolicyStatusSummary"
-$collected["update-feature-summary"] = Invoke-IntuneExportReport -ReportName "FeatureUpdatePolicyStatusSummary"
-$collected["update-quality-summary"] = Invoke-IntuneExportReport -ReportName "QualityUpdatePolicyStatusSummary"
-
-Write-Host ""
-Write-Host "Step 8: Endpoint Analytics" -ForegroundColor Cyan
-Write-Host "───────────────────────────" -ForegroundColor Gray
+$batch3 = [System.Collections.Generic.List[object]]::new()
 
 if (-not $SkipEndpointAnalytics) {
-    $collected["ea-startup-perf"] = Invoke-IntuneExportReport -ReportName "EAStartupPerfDevicePerformanceV2"
-    $collected["ea-startup-model"] = Invoke-IntuneExportReport -ReportName "EAStartupPerfModelPerformanceV2"
-    $collected["ea-app-perf"] = Invoke-IntuneExportReport -ReportName "EAAppPerformance"
-    $collected["ea-resource-device"] = Invoke-IntuneExportReport -ReportName "EAResourcePerfAggByDevice"
-    $collected["ea-resource-model"] = Invoke-IntuneExportReport -ReportName "EAResourcePerfAggByModel"
-    $collected["ea-device-scores"] = Invoke-IntuneExportReport -ReportName "EADeviceScoresV2"
-    $collected["ea-model-scores"] = Invoke-IntuneExportReport -ReportName "EAModelScoresV2"
-    $collected["ea-work-anywhere"] = Invoke-IntuneExportReport -ReportName "EAWFADeviceList"
-    $collected["ea-anomalies"] = Invoke-IntuneExportReport -ReportName "EAAnomalyAssetV2"
-    $collected["ea-battery-model"] = Invoke-IntuneExportReport -ReportName "BRBatteryByModel"
+    $batch3.Add(@{ Key = "ea-startup-perf";    ReportName = "EAStartupPerfDevicePerformanceV2" })
+    $batch3.Add(@{ Key = "ea-startup-model";   ReportName = "EAStartupPerfModelPerformanceV2" })
+    $batch3.Add(@{ Key = "ea-app-perf";        ReportName = "EAAppPerformance" })
+    $batch3.Add(@{ Key = "ea-resource-device"; ReportName = "EAResourcePerfAggByDevice" })
+    $batch3.Add(@{ Key = "ea-resource-model";  ReportName = "EAResourcePerfAggByModel" })
+    $batch3.Add(@{ Key = "ea-device-scores";   ReportName = "EADeviceScoresV2" })
+    $batch3.Add(@{ Key = "ea-model-scores";    ReportName = "EAModelScoresV2" })
+    $batch3.Add(@{ Key = "ea-work-anywhere";   ReportName = "EAWFADeviceList" })
+    $batch3.Add(@{ Key = "ea-anomalies";       ReportName = "EAAnomalyAssetV2" })
+    $batch3.Add(@{ Key = "ea-battery-model";   ReportName = "BRBatteryByModel" })
 } else {
-    Write-Host "  ○ Skipped (SkipEndpointAnalytics)" -ForegroundColor Gray
+    Write-Host "  [SKIP] Endpoint Analytics (SkipEndpointAnalytics)" -ForegroundColor Gray
 }
 
-Write-Host ""
-Write-Host "Step 9: Conditional Access & Proactive Remediations" -ForegroundColor Cyan
-Write-Host "────────────────────────────────────────────────────" -ForegroundColor Gray
+$batch3.Add(@{ Key = "co-management";             ReportName = "ComanagedDeviceWorkloads" })
+$batch3.Add(@{ Key = "co-management-eligibility";  ReportName = "ComanagementEligibilityTenantAttachedDevices" })
+$batch3.Add(@{ Key = "gp-migration-readiness";     ReportName = "GPAnalyticsSettingMigrationReadiness" })
 
-# Conditional Access — uses REST API, not export
+if ($batch3.Count -gt 0) {
+    $batch3Results = Invoke-ExportBatch -Reports $batch3.ToArray()
+    foreach ($key in $batch3Results.Keys) { $collected[$key] = $batch3Results[$key] }
+}
+
+# ─────────────────────────────────────────────────────────
+# Direct API: Conditional Access (not an export report)
+# ─────────────────────────────────────────────────────────
+Write-Host ""
+Write-Host "Conditional Access (direct API)" -ForegroundColor Cyan
+Write-Host "────────────────────────────────" -ForegroundColor Gray
+
 Write-Host "  Collecting Conditional Access policies..." -ForegroundColor Gray -NoNewline
 try {
     $caPolicies = Invoke-GraphPagedRequest -Uri "https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies"
     $collected["conditional-access"] = $caPolicies
-    Write-Host " ✓ ($($caPolicies.Count) policies)" -ForegroundColor Green
+    $caCount = if ($null -ne $caPolicies) { $caPolicies.Count } else { 0 }
+    Write-Host " [OK] ($caCount policies)" -ForegroundColor Green
 } catch {
-    Write-Host " ✗ $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host " [FAIL] $($_.Exception.Message)" -ForegroundColor Yellow
 }
-
-# Co-management
-$collected["co-management"] = Invoke-IntuneExportReport -ReportName "ComanagedDeviceWorkloads"
-$collected["co-management-eligibility"] = Invoke-IntuneExportReport -ReportName "ComanagementEligibilityTenantAttachedDevices"
-
-# GP Analytics
-$collected["gp-migration-readiness"] = Invoke-IntuneExportReport -ReportName "GPAnalyticsSettingMigrationReadiness"
 
 # =========================================================
 # Save to JSON files
