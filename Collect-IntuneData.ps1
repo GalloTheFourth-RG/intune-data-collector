@@ -144,7 +144,7 @@ function Submit-ExportJob {
         [string]$ReportName,
         [string]$Filter = $null,
         [string[]]$Select = $null,
-        [int]$MaxRetries = 2
+        [int]$MaxRetries = 4
     )
 
     $body = @{ reportName = $ReportName; format = "json" }
@@ -161,12 +161,20 @@ function Submit-ExportJob {
         } catch {
             $statusCode = $null
             try { if ($null -ne $_.Exception -and $null -ne $_.Exception.PSObject.Properties['Response'] -and $null -ne $_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode } } catch { }
-            if ($statusCode -eq 429 -and $attempt -lt $MaxRetries) {
-                $retryAfter = 5 * ($attempt + 1)
-                Write-Host "    [throttled on $ReportName, retry in ${retryAfter}s]" -ForegroundColor Yellow
+            # Detect throttling: direct 429 OR Graph SDK internal retry exhaustion
+            $isThrottled = ($statusCode -eq 429) -or ($_.Exception.Message -match 'TooManyRequests')
+            if ($isThrottled -and $attempt -lt $MaxRetries) {
+                $backoffTable = @(8, 15, 30, 60)
+                if ($attempt -lt $backoffTable.Count) { $retryAfter = $backoffTable[$attempt] } else { $retryAfter = 60 }
+                Write-Host "    [throttled on $ReportName, retry $($attempt+1)/$MaxRetries in ${retryAfter}s]" -ForegroundColor Yellow
                 Start-Sleep -Seconds $retryAfter
+            } elseif ($statusCode -eq 400) {
+                Write-Host "    [SKIP] $ReportName - report returned BadRequest (may not be available for this tenant)" -ForegroundColor Yellow
+                return $null
             } else {
-                Write-Host "    [FAIL] Submit $ReportName - $($_.Exception.Message)" -ForegroundColor Red
+                $errMsg = $_.Exception.Message
+                if ($errMsg.Length -gt 200) { $errMsg = $errMsg.Substring(0, 200) + '...' }
+                Write-Host "    [FAIL] Submit $ReportName - $errMsg" -ForegroundColor Red
                 return $null
             }
         }
@@ -233,11 +241,11 @@ function Invoke-ExportBatch {
     $submitIndex = 0
     foreach ($report in $Reports) {
         # Stagger submissions: pause 1s every 5 jobs to stay under rate limits
-        if ($submitIndex -gt 0 -and ($submitIndex % 5) -eq 0) {
-            Write-Host "    (pacing: 2s cooldown)" -ForegroundColor DarkGray
-            Start-Sleep -Seconds 2
+        if ($submitIndex -gt 0 -and ($submitIndex % 4) -eq 0) {
+            Write-Host "    (pacing: 5s cooldown)" -ForegroundColor DarkGray
+            Start-Sleep -Seconds 5
         } elseif ($submitIndex -gt 0) {
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Milliseconds 800
         }
         $rFilter = if ($report.ContainsKey('Filter')) { $report.Filter } else { $null }
         $rSelect = if ($report.ContainsKey('Select')) { $report.Select } else { $null }
@@ -431,8 +439,8 @@ $batch1Results = Invoke-ExportBatch -Reports $batch1
 foreach ($key in $batch1Results.Keys) { $collected[$key] = $batch1Results[$key] }
 
 # Inter-batch cooldown — Intune rate limits cascade across export endpoints
-Write-Host "  (inter-batch cooldown: 5s)" -ForegroundColor DarkGray
-Start-Sleep -Seconds 5
+Write-Host "  (inter-batch cooldown: 10s)" -ForegroundColor DarkGray
+Start-Sleep -Seconds 10
 
 # ─────────────────────────────────────────────────────────
 # Batch 2: Apps + Security + Autopilot + Updates (up to 14 reports)
@@ -473,8 +481,8 @@ if ($batch2.Count -gt 0) {
 }
 
 # Inter-batch cooldown
-Write-Host "  (inter-batch cooldown: 5s)" -ForegroundColor DarkGray
-Start-Sleep -Seconds 5
+Write-Host "  (inter-batch cooldown: 10s)" -ForegroundColor DarkGray
+Start-Sleep -Seconds 10
 
 # ─────────────────────────────────────────────────────────
 # Batch 3: Endpoint Analytics (10 reports) + Co-management
